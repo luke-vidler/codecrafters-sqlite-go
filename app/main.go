@@ -299,21 +299,10 @@ func handleSQLQuery(databaseFilePath string, query string) {
 		os.Exit(1)
 	}
 
-	// Read the table's root page
-	tablePageOffset := int64((rootpage - 1)) * int64(pageSize)
-	tablePage := make([]byte, pageSize)
-	_, err = databaseFile.ReadAt(tablePage, tablePageOffset)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Count cells in the table page
-	// The page header for non-first pages starts at offset 0
-	var cellCount uint16
-	binary.Read(bytes.NewReader(tablePage[3:5]), binary.BigEndian, &cellCount)
-
+	// For COUNT queries, we need to count all rows across all pages
 	if isCountQuery {
-		fmt.Println(cellCount)
+		count := countRows(databaseFile, int64(pageSize), rootpage)
+		fmt.Println(count)
 		return
 	}
 
@@ -338,68 +327,8 @@ func handleSQLQuery(databaseFilePath string, query string) {
 		}
 	}
 
-	// Read cell pointer array
-	cellPointers := make([]uint16, cellCount)
-	for i := 0; i < int(cellCount); i++ {
-		offset := 8 + i*2 // Page header is 8 bytes for non-first pages
-		binary.Read(bytes.NewReader(tablePage[offset:offset+2]), binary.BigEndian, &cellPointers[i])
-	}
-
-	// Read each cell and extract the column value
-	for _, cellOffset := range cellPointers {
-		cellData := tablePage[cellOffset:]
-
-		// Read record size (varint)
-		_, bytesRead := readVarint(cellData)
-		cellData = cellData[bytesRead:]
-
-		// Read rowid (varint) - skip it
-		_, bytesRead = readVarint(cellData)
-		cellData = cellData[bytesRead:]
-
-		// Read record header size
-		headerSize, bytesRead := readVarint(cellData)
-		headerData := cellData[bytesRead:headerSize]
-		cellData = cellData[headerSize:]
-
-		// Read serial types from header
-		var serialTypes []uint64
-		headerBytesRead := 0
-		for headerBytesRead < len(headerData) {
-			serialType, bytes := readVarint(headerData[headerBytesRead:])
-			if bytes == 0 {
-				break // Prevent infinite loop
-			}
-			serialTypes = append(serialTypes, serialType)
-			headerBytesRead += bytes
-		}
-
-		// Now cellData points to the record body
-		// First, extract all column values from the record
-		allColumnValues := make([]string, len(serialTypes))
-		offset := 0
-		for i, serialType := range serialTypes {
-			colSize := getSerialTypeSize(serialType)
-			allColumnValues[i] = string(cellData[offset : offset+colSize])
-			offset += colSize
-		}
-
-		// Check WHERE condition if present
-		if hasWhere {
-			if allColumnValues[whereColumnIndex] != whereValue {
-				continue // Skip this row
-			}
-		}
-
-		// Now extract only the requested columns in the order they were requested
-		var columnValues []string
-		for _, colIndex := range columnIndices {
-			columnValues = append(columnValues, allColumnValues[colIndex])
-		}
-
-		// Print the values separated by |
-		fmt.Println(strings.Join(columnValues, "|"))
-	}
+	// Traverse B-tree and print matching rows
+	traverseAndPrint(databaseFile, int64(pageSize), rootpage, columnIndices, hasWhere, whereColumnIndex, whereValue, createTableSQL, columnNames)
 }
 
 // findTableInfo searches sqlite_schema for the table and returns its rootpage and CREATE TABLE SQL
@@ -513,4 +442,239 @@ func getColumnIndex(createTableSQL string, columnName string) int {
 	}
 
 	return -1
+}
+
+// countRows counts all rows in a B-tree by traversing all pages
+func countRows(file *os.File, pageSize int64, pageNum int) int {
+	pageOffset := int64(pageNum-1) * pageSize
+	page := make([]byte, pageSize)
+	_, err := file.ReadAt(page, pageOffset)
+	if err != nil {
+		return 0
+	}
+
+	// Determine page header offset
+	headerOffset := 0
+	if pageNum == 1 {
+		headerOffset = 100 // First page has 100-byte file header
+	}
+
+	pageType := page[headerOffset]
+	var cellCount uint16
+	binary.Read(bytes.NewReader(page[headerOffset+3:headerOffset+5]), binary.BigEndian, &cellCount)
+
+	if pageType == 0x0d {
+		// Leaf page - return cell count
+		return int(cellCount)
+	} else if pageType == 0x05 {
+		// Interior page - traverse all child pages
+		totalCount := 0
+
+		// Read rightmost pointer (4 bytes at offset 8 in page header)
+		var rightmostPointer uint32
+		binary.Read(bytes.NewReader(page[headerOffset+8:headerOffset+12]), binary.BigEndian, &rightmostPointer)
+
+		// Read cell pointer array
+		cellPointerOffset := headerOffset + 12 // Interior page header is 12 bytes
+		for i := 0; i < int(cellCount); i++ {
+			var cellPointer uint16
+			offset := cellPointerOffset + i*2
+			binary.Read(bytes.NewReader(page[offset:offset+2]), binary.BigEndian, &cellPointer)
+
+			// Read left child pointer from cell (first 4 bytes)
+			var leftChildPointer uint32
+			binary.Read(bytes.NewReader(page[cellPointer:cellPointer+4]), binary.BigEndian, &leftChildPointer)
+
+			// Recursively count rows in left child
+			totalCount += countRows(file, pageSize, int(leftChildPointer))
+		}
+
+		// Add rows from rightmost child
+		totalCount += countRows(file, pageSize, int(rightmostPointer))
+
+		return totalCount
+	}
+
+	return 0
+}
+
+// traverseAndPrint traverses the B-tree and prints rows matching the criteria
+func traverseAndPrint(file *os.File, pageSize int64, pageNum int, columnIndices []int, hasWhere bool, whereColumnIndex int, whereValue string, createTableSQL string, columnNames []string) {
+	pageOffset := int64(pageNum-1) * pageSize
+	page := make([]byte, pageSize)
+	_, err := file.ReadAt(page, pageOffset)
+	if err != nil {
+		return
+	}
+
+	// Determine page header offset
+	headerOffset := 0
+	if pageNum == 1 {
+		headerOffset = 100 // First page has 100-byte file header
+	}
+
+	pageType := page[headerOffset]
+	var cellCount uint16
+	binary.Read(bytes.NewReader(page[headerOffset+3:headerOffset+5]), binary.BigEndian, &cellCount)
+
+	if pageType == 0x0d {
+		// Leaf page - process all cells
+		cellPointerOffset := headerOffset + 8 // Leaf page header is 8 bytes
+		for i := 0; i < int(cellCount); i++ {
+			var cellPointer uint16
+			offset := cellPointerOffset + i*2
+			binary.Read(bytes.NewReader(page[offset:offset+2]), binary.BigEndian, &cellPointer)
+
+			processCell(page[cellPointer:], columnIndices, hasWhere, whereColumnIndex, whereValue, createTableSQL, columnNames)
+		}
+	} else if pageType == 0x05 {
+		// Interior page - traverse all child pages
+		// Read rightmost pointer
+		var rightmostPointer uint32
+		binary.Read(bytes.NewReader(page[headerOffset+8:headerOffset+12]), binary.BigEndian, &rightmostPointer)
+
+		// Read cell pointer array and traverse left children
+		cellPointerOffset := headerOffset + 12 // Interior page header is 12 bytes
+		for i := 0; i < int(cellCount); i++ {
+			var cellPointer uint16
+			offset := cellPointerOffset + i*2
+			binary.Read(bytes.NewReader(page[offset:offset+2]), binary.BigEndian, &cellPointer)
+
+			// Read left child pointer from cell (first 4 bytes)
+			var leftChildPointer uint32
+			binary.Read(bytes.NewReader(page[cellPointer:cellPointer+4]), binary.BigEndian, &leftChildPointer)
+
+			// Recursively traverse left child
+			traverseAndPrint(file, pageSize, int(leftChildPointer), columnIndices, hasWhere, whereColumnIndex, whereValue, createTableSQL, columnNames)
+		}
+
+		// Traverse rightmost child
+		traverseAndPrint(file, pageSize, int(rightmostPointer), columnIndices, hasWhere, whereColumnIndex, whereValue, createTableSQL, columnNames)
+	}
+}
+
+// processCell extracts and prints column values from a single cell
+func processCell(cellData []byte, columnIndices []int, hasWhere bool, whereColumnIndex int, whereValue string, createTableSQL string, columnNames []string) {
+	// Read record size (varint)
+	_, bytesRead := readVarint(cellData)
+	cellData = cellData[bytesRead:]
+
+	// Read rowid (varint) - we need to keep this for INTEGER PRIMARY KEY
+	rowid, bytesRead := readVarint(cellData)
+	cellData = cellData[bytesRead:]
+
+	// Read record header size
+	headerSize, bytesRead := readVarint(cellData)
+	headerData := cellData[bytesRead:headerSize]
+	cellData = cellData[headerSize:]
+
+	// Read serial types from header
+	var serialTypes []uint64
+	headerBytesRead := 0
+	for headerBytesRead < len(headerData) {
+		serialType, bytes := readVarint(headerData[headerBytesRead:])
+		if bytes == 0 {
+			break
+		}
+		serialTypes = append(serialTypes, serialType)
+		headerBytesRead += bytes
+	}
+
+	// Extract all column values from the record
+	allColumnValues := make([]string, len(serialTypes))
+	offset := 0
+	for i, serialType := range serialTypes {
+		colSize := getSerialTypeSize(serialType)
+		allColumnValues[i] = readColumnValue(cellData[offset:offset+colSize], serialType)
+		offset += colSize
+	}
+
+	// Check WHERE condition if present
+	if hasWhere {
+		if allColumnValues[whereColumnIndex] != whereValue {
+			return // Skip this row
+		}
+	}
+
+	// Check if any requested column is an INTEGER PRIMARY KEY (uses rowid)
+	// Parse the schema to detect this
+	isPKColumn := make([]bool, len(columnNames))
+	for i, colName := range columnNames {
+		// Simple heuristic: check if column is "id" and appears as "integer primary key" in schema
+		if strings.Contains(strings.ToLower(createTableSQL), strings.ToLower(colName)+" integer primary key") {
+			isPKColumn[i] = true
+		}
+	}
+
+	// Extract only the requested columns in the order they were requested
+	var columnValues []string
+	for i, colIndex := range columnIndices {
+		// If this column is the INTEGER PRIMARY KEY, use rowid instead
+		if isPKColumn[i] {
+			columnValues = append(columnValues, fmt.Sprintf("%d", rowid))
+		} else {
+			columnValues = append(columnValues, allColumnValues[colIndex])
+		}
+	}
+
+	// Print the values separated by |
+	fmt.Println(strings.Join(columnValues, "|"))
+}
+
+// readColumnValue reads a column value based on its serial type and returns it as a string
+func readColumnValue(data []byte, serialType uint64) string {
+	if serialType == 0 {
+		return "" // NULL
+	} else if serialType == 1 {
+		// 8-bit twos-complement integer
+		return fmt.Sprintf("%d", int8(data[0]))
+	} else if serialType == 2 {
+		// 16-bit big-endian integer
+		var val int16
+		binary.Read(bytes.NewReader(data), binary.BigEndian, &val)
+		return fmt.Sprintf("%d", val)
+	} else if serialType == 3 {
+		// 24-bit big-endian integer
+		val := int32(data[0])<<16 | int32(data[1])<<8 | int32(data[2])
+		// Sign extend if negative
+		if val&0x800000 != 0 {
+			val |= ^0xFFFFFF
+		}
+		return fmt.Sprintf("%d", val)
+	} else if serialType == 4 {
+		// 32-bit big-endian integer
+		var val int32
+		binary.Read(bytes.NewReader(data), binary.BigEndian, &val)
+		return fmt.Sprintf("%d", val)
+	} else if serialType == 5 {
+		// 48-bit big-endian integer
+		val := int64(data[0])<<40 | int64(data[1])<<32 | int64(data[2])<<24 |
+			int64(data[3])<<16 | int64(data[4])<<8 | int64(data[5])
+		// Sign extend if negative
+		if val&0x800000000000 != 0 {
+			val |= ^0xFFFFFFFFFFFF
+		}
+		return fmt.Sprintf("%d", val)
+	} else if serialType == 6 {
+		// 64-bit big-endian integer
+		var val int64
+		binary.Read(bytes.NewReader(data), binary.BigEndian, &val)
+		return fmt.Sprintf("%d", val)
+	} else if serialType == 7 {
+		// 64-bit IEEE float
+		var val float64
+		binary.Read(bytes.NewReader(data), binary.BigEndian, &val)
+		return fmt.Sprintf("%f", val)
+	} else if serialType == 8 {
+		return "0" // constant 0
+	} else if serialType == 9 {
+		return "1" // constant 1
+	} else if serialType >= 12 && serialType%2 == 0 {
+		// BLOB
+		return string(data)
+	} else if serialType >= 13 && serialType%2 == 1 {
+		// String
+		return string(data)
+	}
+	return ""
 }
