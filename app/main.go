@@ -6,8 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
-	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
+	"strings"
+
+	"github.com/xwb1989/sqlparser"
 )
 
 // readVarint reads a varint from the byte slice and returns the value and number of bytes read
@@ -217,10 +218,40 @@ func getSerialTypeSize(serialType uint64) int {
 
 // handleSQLQuery handles SQL queries
 func handleSQLQuery(databaseFilePath string, query string) {
-	// For now, we only handle SELECT COUNT(*) FROM <table>
-	// Simple parsing: split by space and get the last word as table name
-	parts := bytes.Fields([]byte(query))
-	tableName := string(parts[len(parts)-1])
+	// Parse the SQL query
+	stmt, err := sqlparser.Parse(query)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	selectStmt, ok := stmt.(*sqlparser.Select)
+	if !ok {
+		log.Fatal("Not a SELECT statement")
+	}
+
+	// Extract table name
+	tableName := sqlparser.String(selectStmt.From[0])
+
+	// Check if it's COUNT(*)
+	isCountQuery := false
+	var columnName string
+	if len(selectStmt.SelectExprs) > 0 {
+		switch expr := selectStmt.SelectExprs[0].(type) {
+		case *sqlparser.StarExpr:
+			// SELECT *
+			columnName = "*"
+		case *sqlparser.AliasedExpr:
+			// Check if it's COUNT(*)
+			if funcExpr, ok := expr.Expr.(*sqlparser.FuncExpr); ok {
+				if strings.ToUpper(funcExpr.Name.String()) == "COUNT" {
+					isCountQuery = true
+				}
+			} else {
+				// Regular column selection
+				columnName = sqlparser.String(expr.Expr)
+			}
+		}
+	}
 
 	databaseFile, err := os.Open(databaseFilePath)
 	if err != nil {
@@ -244,8 +275,8 @@ func handleSQLQuery(databaseFilePath string, query string) {
 		log.Fatal(err)
 	}
 
-	// Find the rootpage for the given table
-	rootpage := findRootpage(page, tableName)
+	// Find the rootpage and CREATE TABLE statement for the given table
+	rootpage, createTableSQL := findTableInfo(page, tableName)
 	if rootpage == 0 {
 		fmt.Printf("Table %s not found\n", tableName)
 		os.Exit(1)
@@ -264,11 +295,72 @@ func handleSQLQuery(databaseFilePath string, query string) {
 	var cellCount uint16
 	binary.Read(bytes.NewReader(tablePage[3:5]), binary.BigEndian, &cellCount)
 
-	fmt.Println(cellCount)
+	if isCountQuery {
+		fmt.Println(cellCount)
+		return
+	}
+
+	// Parse CREATE TABLE to get column order
+	columnIndex := getColumnIndex(createTableSQL, columnName)
+	if columnIndex == -1 {
+		fmt.Printf("Column %s not found\n", columnName)
+		os.Exit(1)
+	}
+
+	// Read cell pointer array
+	cellPointers := make([]uint16, cellCount)
+	for i := 0; i < int(cellCount); i++ {
+		offset := 8 + i*2 // Page header is 8 bytes for non-first pages
+		binary.Read(bytes.NewReader(tablePage[offset:offset+2]), binary.BigEndian, &cellPointers[i])
+	}
+
+	// Read each cell and extract the column value
+	for _, cellOffset := range cellPointers {
+		cellData := tablePage[cellOffset:]
+
+		// Read record size (varint)
+		_, bytesRead := readVarint(cellData)
+		cellData = cellData[bytesRead:]
+
+		// Read rowid (varint) - skip it
+		_, bytesRead = readVarint(cellData)
+		cellData = cellData[bytesRead:]
+
+		// Read record header size
+		headerSize, bytesRead := readVarint(cellData)
+		headerData := cellData[bytesRead:headerSize]
+		cellData = cellData[headerSize:]
+
+		// Read serial types from header
+		var serialTypes []uint64
+		headerBytesRead := 0
+		for headerBytesRead < len(headerData) {
+			serialType, bytes := readVarint(headerData[headerBytesRead:])
+			if bytes == 0 {
+				break // Prevent infinite loop
+			}
+			serialTypes = append(serialTypes, serialType)
+			headerBytesRead += bytes
+		}
+
+		// Now cellData points to the record body
+		// Skip to the column we want
+		for i := 0; i < columnIndex; i++ {
+			columnSize := getSerialTypeSize(serialTypes[i])
+			cellData = cellData[columnSize:]
+		}
+
+		// Read the column value
+		columnSize := getSerialTypeSize(serialTypes[columnIndex])
+		columnValue := cellData[:columnSize]
+
+		// Print the value (assuming it's text for now)
+		fmt.Println(string(columnValue))
+	}
 }
 
-// findRootpage searches sqlite_schema for the table and returns its rootpage
-func findRootpage(page []byte, tableName string) int {
+// findTableInfo searches sqlite_schema for the table and returns its rootpage and CREATE TABLE SQL
+func findTableInfo(page []byte, tableName string) (int, string) {
 	// Read cell count from page header (offset 103-104 in page 1)
 	var cellCount uint16
 	binary.Read(bytes.NewReader(page[103:105]), binary.BigEndian, &cellCount)
@@ -327,12 +419,55 @@ func findRootpage(page []byte, tableName string) int {
 		if tblName == tableName {
 			// Read rootpage column (serial type should be 1 for 8-bit int)
 			rootpageValue := int(cellData[0])
-			return rootpageValue
+			cellData = cellData[1:]
+
+			// Read sql column (5th column)
+			sqlSize := getSerialTypeSize(serialTypes[4])
+			sqlText := string(cellData[:sqlSize])
+
+			return rootpageValue, sqlText
 		}
 
 		// Reset for next iteration
 		cellData = bodyStart
 	}
 
-	return 0
+	return 0, ""
+}
+
+// getColumnIndex parses the CREATE TABLE statement and returns the index of the given column
+func getColumnIndex(createTableSQL string, columnName string) int {
+	// Simple parser: extract column names from CREATE TABLE statement
+	// Find the opening parenthesis
+	startIdx := strings.Index(createTableSQL, "(")
+	if startIdx == -1 {
+		return -1
+	}
+
+	// Find the closing parenthesis
+	endIdx := strings.LastIndex(createTableSQL, ")")
+	if endIdx == -1 {
+		return -1
+	}
+
+	// Extract the columns section
+	columnsStr := createTableSQL[startIdx+1 : endIdx]
+
+	// Split by comma to get individual column definitions
+	// This is a simplified approach that works for basic schemas
+	columns := strings.Split(columnsStr, ",")
+
+	for i, colDef := range columns {
+		// Extract the column name (first word after trimming)
+		colDef = strings.TrimSpace(colDef)
+		parts := strings.Fields(colDef)
+		if len(parts) > 0 {
+			colName := parts[0]
+			if strings.EqualFold(colName, columnName) {
+				return i
+			}
+		}
+	}
+
+	return -1
 }
