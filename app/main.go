@@ -10,6 +10,29 @@ import (
 	// "github.com/xwb1989/sqlparser"
 )
 
+// readVarint reads a varint from the byte slice and returns the value and number of bytes read
+func readVarint(data []byte) (uint64, int) {
+	var result uint64
+	for i := 0; i < 9; i++ {
+		if i >= len(data) {
+			return 0, 0
+		}
+		b := data[i]
+		if i == 8 {
+			// 9th byte: use all 8 bits
+			result = (result << 8) | uint64(b)
+			return result, i + 1
+		}
+		// Use lower 7 bits
+		result = (result << 7) | uint64(b&0x7F)
+		if b&0x80 == 0 {
+			// High bit is 0, this is the last byte
+			return result, i + 1
+		}
+	}
+	return result, 9
+}
+
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
 	databaseFilePath := os.Args[1]
@@ -51,8 +74,137 @@ func main() {
 		// Uncomment this to pass the first stage
 		fmt.Printf("database page size: %v\n", pageSize)
 		fmt.Printf("number of tables: %v\n", cellCount)
+	case ".tables":
+		databaseFile, err := os.Open(databaseFilePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer databaseFile.Close()
+
+		// Read the first page (page 1, which contains sqlite_schema)
+		var pageSize uint16
+		pageSizeBytes := make([]byte, 2)
+		_, err = databaseFile.ReadAt(pageSizeBytes, 16)
+		if err != nil {
+			log.Fatal(err)
+		}
+		binary.Read(bytes.NewReader(pageSizeBytes), binary.BigEndian, &pageSize)
+
+		// Read the entire first page
+		page := make([]byte, pageSize)
+		_, err = databaseFile.ReadAt(page, 0)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		// Read cell count from page header (offset 103-104 in page 1)
+		var cellCount uint16
+		binary.Read(bytes.NewReader(page[103:105]), binary.BigEndian, &cellCount)
+
+		// Read cell pointer array (starts at offset 108, after 8-byte page header)
+		// Note: On page 1, the page header starts at offset 100 (after the 100-byte file header)
+		cellPointers := make([]uint16, cellCount)
+		for i := 0; i < int(cellCount); i++ {
+			offset := 108 + i*2
+			binary.Read(bytes.NewReader(page[offset:offset+2]), binary.BigEndian, &cellPointers[i])
+		}
+
+		// Parse each cell to extract table names
+		var tableNames []string
+		for _, cellOffset := range cellPointers {
+			// Read the cell
+			cellData := page[cellOffset:]
+
+			// Read record size (varint)
+			recordSize, bytesRead := readVarint(cellData)
+			_ = recordSize // We don't need this for now
+			cellData = cellData[bytesRead:]
+
+			// Read rowid (varint) - skip it
+			_, bytesRead = readVarint(cellData)
+			cellData = cellData[bytesRead:]
+
+			// Now we're at the record
+			// Read record header size
+			headerSize, bytesRead := readVarint(cellData)
+			headerStart := cellData
+			cellData = cellData[bytesRead:]
+
+			// Read serial types from header
+			var serialTypes []uint64
+			headerBytesRead := bytesRead
+			for headerBytesRead < int(headerSize) {
+				serialType, bytes := readVarint(cellData)
+				serialTypes = append(serialTypes, serialType)
+				cellData = cellData[bytes:]
+				headerBytesRead += bytes
+			}
+
+			// Now cellData points to the record body
+			// We need to read the columns based on serial types
+			// sqlite_schema columns: type, name, tbl_name, rootpage, sql
+
+			// Skip the first column (type)
+			typeSize := getSerialTypeSize(serialTypes[0])
+			cellData = cellData[typeSize:]
+
+			// Skip the second column (name)
+			nameSize := getSerialTypeSize(serialTypes[1])
+			cellData = cellData[nameSize:]
+
+			// Read the third column (tbl_name) - this is what we want!
+			tblNameSize := getSerialTypeSize(serialTypes[2])
+			tblName := string(cellData[:tblNameSize])
+
+			// Filter out internal sqlite tables (those starting with "sqlite_")
+			if len(tblName) < 7 || tblName[:7] != "sqlite_" {
+				tableNames = append(tableNames, tblName)
+			}
+
+			// Reset cellData to point after the header for debugging
+			cellData = headerStart[headerSize:]
+		}
+
+		// Print table names separated by space
+		for i, name := range tableNames {
+			if i > 0 {
+				fmt.Print(" ")
+			}
+			fmt.Print(name)
+		}
+		fmt.Println()
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
 	}
+}
+
+// getSerialTypeSize returns the size in bytes for a given serial type
+func getSerialTypeSize(serialType uint64) int {
+	if serialType == 0 {
+		return 0 // NULL
+	} else if serialType == 1 {
+		return 1 // 8-bit int
+	} else if serialType == 2 {
+		return 2 // 16-bit int
+	} else if serialType == 3 {
+		return 3 // 24-bit int
+	} else if serialType == 4 {
+		return 4 // 32-bit int
+	} else if serialType == 5 {
+		return 6 // 48-bit int
+	} else if serialType == 6 {
+		return 8 // 64-bit int
+	} else if serialType == 7 {
+		return 8 // float
+	} else if serialType == 8 || serialType == 9 {
+		return 0 // constant 0 or 1
+	} else if serialType >= 12 && serialType%2 == 0 {
+		// BLOB: (N-12)/2 bytes
+		return int((serialType - 12) / 2)
+	} else if serialType >= 13 && serialType%2 == 1 {
+		// String: (N-13)/2 bytes
+		return int((serialType - 13) / 2)
+	}
+	return 0
 }
