@@ -232,14 +232,14 @@ func handleSQLQuery(databaseFilePath string, query string) {
 	// Extract table name
 	tableName := sqlparser.String(selectStmt.From[0])
 
-	// Check if it's COUNT(*)
+	// Check if it's COUNT(*) or extract column names
 	isCountQuery := false
-	var columnName string
-	if len(selectStmt.SelectExprs) > 0 {
-		switch expr := selectStmt.SelectExprs[0].(type) {
+	var columnNames []string
+	for _, selectExpr := range selectStmt.SelectExprs {
+		switch expr := selectExpr.(type) {
 		case *sqlparser.StarExpr:
 			// SELECT *
-			columnName = "*"
+			columnNames = append(columnNames, "*")
 		case *sqlparser.AliasedExpr:
 			// Check if it's COUNT(*)
 			if funcExpr, ok := expr.Expr.(*sqlparser.FuncExpr); ok {
@@ -248,7 +248,7 @@ func handleSQLQuery(databaseFilePath string, query string) {
 				}
 			} else {
 				// Regular column selection
-				columnName = sqlparser.String(expr.Expr)
+				columnNames = append(columnNames, sqlparser.String(expr.Expr))
 			}
 		}
 	}
@@ -300,11 +300,15 @@ func handleSQLQuery(databaseFilePath string, query string) {
 		return
 	}
 
-	// Parse CREATE TABLE to get column order
-	columnIndex := getColumnIndex(createTableSQL, columnName)
-	if columnIndex == -1 {
-		fmt.Printf("Column %s not found\n", columnName)
-		os.Exit(1)
+	// Parse CREATE TABLE to get column indices for all requested columns
+	var columnIndices []int
+	for _, colName := range columnNames {
+		colIndex := getColumnIndex(createTableSQL, colName)
+		if colIndex == -1 {
+			fmt.Printf("Column %s not found\n", colName)
+			os.Exit(1)
+		}
+		columnIndices = append(columnIndices, colIndex)
 	}
 
 	// Read cell pointer array
@@ -344,18 +348,23 @@ func handleSQLQuery(databaseFilePath string, query string) {
 		}
 
 		// Now cellData points to the record body
-		// Skip to the column we want
-		for i := 0; i < columnIndex; i++ {
-			columnSize := getSerialTypeSize(serialTypes[i])
-			cellData = cellData[columnSize:]
+		// First, extract all column values from the record
+		allColumnValues := make([]string, len(serialTypes))
+		offset := 0
+		for i, serialType := range serialTypes {
+			colSize := getSerialTypeSize(serialType)
+			allColumnValues[i] = string(cellData[offset : offset+colSize])
+			offset += colSize
 		}
 
-		// Read the column value
-		columnSize := getSerialTypeSize(serialTypes[columnIndex])
-		columnValue := cellData[:columnSize]
+		// Now extract only the requested columns in the order they were requested
+		var columnValues []string
+		for _, colIndex := range columnIndices {
+			columnValues = append(columnValues, allColumnValues[colIndex])
+		}
 
-		// Print the value (assuming it's text for now)
-		fmt.Println(string(columnValue))
+		// Print the values separated by |
+		fmt.Println(strings.Join(columnValues, "|"))
 	}
 }
 
