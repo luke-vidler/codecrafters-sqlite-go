@@ -253,6 +253,23 @@ func handleSQLQuery(databaseFilePath string, query string) {
 		}
 	}
 
+	// Parse WHERE clause if present
+	var whereColumn string
+	var whereValue string
+	hasWhere := false
+	if selectStmt.Where != nil {
+		// Simple WHERE parsing: column = 'value'
+		if comparisonExpr, ok := selectStmt.Where.Expr.(*sqlparser.ComparisonExpr); ok {
+			if comparisonExpr.Operator == "=" {
+				whereColumn = sqlparser.String(comparisonExpr.Left)
+				// Extract the value (remove quotes)
+				whereValueRaw := sqlparser.String(comparisonExpr.Right)
+				whereValue = strings.Trim(whereValueRaw, "'\"")
+				hasWhere = true
+			}
+		}
+	}
+
 	databaseFile, err := os.Open(databaseFilePath)
 	if err != nil {
 		log.Fatal(err)
@@ -311,6 +328,16 @@ func handleSQLQuery(databaseFilePath string, query string) {
 		columnIndices = append(columnIndices, colIndex)
 	}
 
+	// Get WHERE column index if needed
+	var whereColumnIndex int = -1
+	if hasWhere {
+		whereColumnIndex = getColumnIndex(createTableSQL, whereColumn)
+		if whereColumnIndex == -1 {
+			fmt.Printf("WHERE column %s not found\n", whereColumn)
+			os.Exit(1)
+		}
+	}
+
 	// Read cell pointer array
 	cellPointers := make([]uint16, cellCount)
 	for i := 0; i < int(cellCount); i++ {
@@ -355,6 +382,13 @@ func handleSQLQuery(databaseFilePath string, query string) {
 			colSize := getSerialTypeSize(serialType)
 			allColumnValues[i] = string(cellData[offset : offset+colSize])
 			offset += colSize
+		}
+
+		// Check WHERE condition if present
+		if hasWhere {
+			if allColumnValues[whereColumnIndex] != whereValue {
+				continue // Skip this row
+			}
 		}
 
 		// Now extract only the requested columns in the order they were requested
